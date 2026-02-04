@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::fmt;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde_json::Value;
@@ -11,6 +12,22 @@ use crate::types::{Fill, Instrument, OrderRequest, OrderResponse, OrderType, Sid
 use crate::utils::now_ms;
 
 type HmacSha256 = Hmac<Sha256>;
+
+pub const CODE_INSUFFICIENT_BALANCE: i64 = 110007;
+
+#[derive(Debug)]
+pub struct ExecutionError {
+    pub code: i64,
+    pub msg: String,
+}
+
+impl fmt::Display for ExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "api error {}: {}", self.code, self.msg)
+    }
+}
+
+impl std::error::Error for ExecutionError {}
 
 #[derive(Clone)]
 pub struct ExecutionEngine {
@@ -193,8 +210,12 @@ impl ExecutionEngine {
                         .get("retMsg")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error");
-                    if attempt >= 3 {
-                        return Err(anyhow!("api error {}: {}", ret_code, message));
+                    let api_error = ExecutionError {
+                        code: ret_code,
+                        msg: message.to_string(),
+                    };
+                    if ret_code == CODE_INSUFFICIENT_BALANCE || attempt >= 3 {
+                        return Err(api_error.into());
                     }
                     warn!(
                         "api error {}, retrying attempt {}: {}",

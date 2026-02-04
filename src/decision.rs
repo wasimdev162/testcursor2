@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
 use crate::config::AlgoConfig;
-use crate::execution::ExecutionEngine;
+use crate::execution::{ExecutionEngine, ExecutionError, CODE_INSUFFICIENT_BALANCE};
 use crate::performance::PerformanceTracker;
 use crate::types::{
     ActiveOrder, ExecutionTarget, Instrument, MarketEvent, OrderRequest, OrderType,
@@ -92,6 +92,10 @@ struct InstrumentState {
     active_orders: HashMap<String, ActiveOrder>,
     quote_window_start: u64,
     quote_updates: u64,
+    halted: bool,
+    cooldown_until: u64,
+    reject_count: u32,
+    last_reject_code: Option<i64>,
 }
 
 impl InstrumentState {
@@ -108,6 +112,10 @@ impl InstrumentState {
             active_orders: HashMap::new(),
             quote_window_start: now_ms(),
             quote_updates: 0,
+            halted: false,
+            cooldown_until: 0,
+            reject_count: 0,
+            last_reject_code: None,
         }
     }
 }
@@ -219,6 +227,12 @@ impl DecisionEngine {
             if state.remaining_qty <= 0.0 {
                 continue;
             }
+            if state.halted {
+                continue;
+            }
+            if now < state.cooldown_until {
+                continue;
+            }
             let Some(signals) = compute_signals(state) else {
                 continue;
             };
@@ -266,7 +280,7 @@ impl DecisionEngine {
     fn is_complete(&self) -> bool {
         self.states
             .values()
-            .all(|state| state.remaining_qty <= 0.0)
+            .all(|state| state.remaining_qty <= 0.0 || state.halted)
     }
 
     pub fn metrics_summary(&self) -> Vec<(String, crate::performance::InstrumentMetrics)> {
@@ -431,7 +445,16 @@ async fn place_child_order(
         reduce_only: false,
     };
 
-    let response = execution.place_order(request).await?;
+    let response = match execution.place_order(request).await {
+        Ok(response) => response,
+        Err(err) => {
+            handle_execution_error(state, &err, "place_order");
+            return Ok(());
+        }
+    };
+    state.reject_count = 0;
+    state.cooldown_until = 0;
+    state.last_reject_code = None;
     let placed_at = now_ms();
     if let Some(book) = &state.order_book {
         let level_qty = find_level_qty(book, price, state.side).unwrap_or(0.0);
@@ -478,9 +501,16 @@ async fn cancel_stale_orders(
         }
     }
     for order_id in to_cancel {
-        execution
+        if let Err(err) = execution
             .cancel_order(&state.instrument, &order_id)
-            .await?;
+            .await
+        {
+            warn!(
+                "cancel failed instrument={} order_id={} error={}",
+                state.instrument.symbol, order_id, err
+            );
+            handle_execution_error(state, &err, "cancel_order");
+        }
         state.active_orders.remove(&order_id);
     }
     Ok(())
@@ -492,7 +522,17 @@ async fn poll_fills(
     seen_fills: &mut HashSet<String>,
     state: &mut InstrumentState,
 ) -> Result<()> {
-    let fills = execution.fetch_executions(&state.instrument, 50).await?;
+    let fills = match execution.fetch_executions(&state.instrument, 50).await {
+        Ok(fills) => fills,
+        Err(err) => {
+            warn!(
+                "fill poll failed instrument={} error={}",
+                state.instrument.symbol, err
+            );
+            handle_execution_error(state, &err, "fetch_executions");
+            return Ok(());
+        }
+    };
     for fill in fills {
         let key = fill
             .exec_id
@@ -514,6 +554,9 @@ async fn force_finish(
     states: &mut HashMap<String, InstrumentState>,
 ) -> Result<()> {
     for state in states.values_mut() {
+        if state.halted {
+            continue;
+        }
         if state.remaining_qty <= 0.0 {
             continue;
         }
@@ -557,6 +600,44 @@ fn best_level_qty(signals: &MicrostructureSignals, state: &InstrumentState) -> f
     } else {
         qty
     }
+}
+
+fn handle_execution_error(state: &mut InstrumentState, err: &Error, context: &str) {
+    let now = now_ms();
+    if let Some(api_err) = err.downcast_ref::<ExecutionError>() {
+        if api_err.code == CODE_INSUFFICIENT_BALANCE {
+            if state.last_reject_code != Some(api_err.code) {
+                warn!(
+                    "insufficient balance, halting {} {}: {}",
+                    state.instrument.category.as_str(),
+                    state.instrument.symbol,
+                    api_err
+                );
+            }
+            state.halted = true;
+            state.remaining_qty = 0.0;
+            state.last_reject_code = Some(api_err.code);
+            return;
+        }
+        if state.last_reject_code != Some(api_err.code) {
+            warn!(
+                "execution api error context={} instrument={} code={} msg={}",
+                context, state.instrument.symbol, api_err.code, api_err.msg
+            );
+            state.last_reject_code = Some(api_err.code);
+        }
+    } else {
+        warn!(
+            "execution error context={} instrument={} error={}",
+            context, state.instrument.symbol, err
+        );
+        state.last_reject_code = None;
+    }
+
+    state.reject_count = (state.reject_count + 1).min(6);
+    let exponent = state.reject_count.min(5) as u32;
+    let backoff_ms = 250u64.saturating_mul(1u64 << exponent);
+    state.cooldown_until = now.saturating_add(backoff_ms);
 }
 
 fn compute_imbalance(book: &OrderBookSnapshot) -> f64 {
