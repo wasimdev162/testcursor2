@@ -61,6 +61,7 @@ pub struct Level {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OrderBookSnapshot {
     pub bids: Vec<Level>,
     pub asks: Vec<Level>,
@@ -68,6 +69,7 @@ pub struct OrderBookSnapshot {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Trade {
     pub price: f64,
     pub qty: f64,
@@ -105,12 +107,14 @@ pub struct OrderRequest {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OrderResponse {
     pub order_id: String,
     pub status: String,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Fill {
     pub exec_id: Option<String>,
     pub order_id: String,
@@ -128,6 +132,7 @@ pub struct ExecutionTarget {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ActiveOrder {
     pub order_id: String,
     pub instrument: Instrument,

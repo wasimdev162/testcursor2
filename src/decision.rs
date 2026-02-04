@@ -83,7 +83,6 @@ impl RollingStats {
 struct InstrumentState {
     instrument: Instrument,
     side: Side,
-    target_qty: f64,
     remaining_qty: f64,
     order_book: Option<OrderBookSnapshot>,
     trades: VecDeque<Trade>,
@@ -100,7 +99,6 @@ impl InstrumentState {
         Self {
             instrument: target.instrument.clone(),
             side: target.side,
-            target_qty: target.total_qty,
             remaining_qty: target.total_qty,
             order_book: None,
             trades: VecDeque::with_capacity(trade_window),

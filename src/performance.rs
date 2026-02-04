@@ -5,7 +5,6 @@ use crate::types::{ExecutionTarget, Fill, Instrument, Side, Trade};
 #[derive(Debug, Clone)]
 struct DecisionRecord {
     decision_price: f64,
-    qty: f64,
     side: Side,
 }
 
@@ -93,7 +92,6 @@ impl PerformanceTracker {
     ) {
         let record = DecisionRecord {
             decision_price,
-            qty,
             side,
         };
         self.decisions.insert(order_id, record);
@@ -119,10 +117,6 @@ impl PerformanceTracker {
             metrics.market_vwap_notional += trade.price * trade.qty;
             metrics.market_vwap_qty += trade.qty;
         }
-    }
-
-    pub fn get_metrics(&self, instrument: &Instrument) -> Option<&InstrumentMetrics> {
-        self.metrics.get(&instrument_key(instrument))
     }
 
     pub fn metrics_summary(&self) -> Vec<(String, InstrumentMetrics)> {

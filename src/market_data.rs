@@ -42,7 +42,18 @@ impl MarketDataHandler {
 
         loop {
             info!("connecting to {} for {}", url, instrument.symbol);
-            let (ws_stream, _) = connect_async(&url).await?;
+            let (ws_stream, _) = match connect_async(&url).await {
+                Ok(stream) => {
+                    backoff = 1;
+                    stream
+                }
+                Err(err) => {
+                    warn!("connect failed: {}, retrying in {}s", err, backoff);
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(32);
+                    continue;
+                }
+            };
             let (mut write, mut read) = ws_stream.split();
 
             let orderbook_topic = format!("orderbook.{}.{}", self.depth, instrument.symbol);
@@ -55,7 +66,6 @@ impl MarketDataHandler {
                 .send(Message::Text(subscribe.to_string().into()))
                 .await?;
 
-            backoff = 1;
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
