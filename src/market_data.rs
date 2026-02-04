@@ -51,7 +51,9 @@ impl MarketDataHandler {
                 "op": "subscribe",
                 "args": [orderbook_topic, trades_topic]
             });
-            write.send(Message::Text(subscribe.to_string())).await?;
+            write
+                .send(Message::Text(subscribe.to_string().into()))
+                .await?;
 
             backoff = 1;
             while let Some(msg) = read.next().await {

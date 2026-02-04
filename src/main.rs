@@ -9,7 +9,7 @@ mod utils;
 use anyhow::Result;
 use clap::Parser;
 use tokio::sync::mpsc;
-use tracing::{info, Level};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Cli;
