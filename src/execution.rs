@@ -7,7 +7,7 @@ use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
@@ -129,18 +129,15 @@ impl BybitClient {
 
 pub struct ExecutionEngine {
     client: BybitClient,
-    instrument_map: HashMap<String, InstrumentType>,
+    instrument_lookup: InstrumentLookup,
 }
 
 impl ExecutionEngine {
     pub fn new(client: BybitClient, instruments: &[InstrumentConfig]) -> Self {
-        let instrument_map = instruments
-            .iter()
-            .map(|inst| (inst.symbol.clone(), inst.instrument_type))
-            .collect();
+        let instrument_lookup = InstrumentLookup::new(instruments);
         Self {
             client,
-            instrument_map,
+            instrument_lookup,
         }
     }
 
@@ -249,6 +246,10 @@ impl ExecutionEngine {
         let response = self.client.private_post("/v5/order/cancel", &body).await?;
         let ret_code = response.get("retCode").and_then(Value::as_i64).unwrap_or(-1);
         if ret_code != 0 {
+            if ret_code == 170213 || ret_code == 170216 {
+                tracing::info!(response = ?response, "cancel skipped (already gone)");
+                return Ok(());
+            }
             tracing::warn!(response = ?response, "cancel rejected");
             return Err(anyhow!("cancel rejected: {}", response));
         }
@@ -267,7 +268,7 @@ impl ExecutionEngine {
     ) {
         let api_key = self.client.api_key.clone();
         let api_secret = self.client.api_secret.clone();
-        let instrument_map = Arc::new(self.instrument_map.clone());
+        let instrument_lookup = Arc::new(self.instrument_lookup.clone());
 
         tokio::spawn(async move {
             loop {
@@ -275,7 +276,7 @@ impl ExecutionEngine {
                     &ws_private_url,
                     &api_key,
                     &api_secret,
-                    instrument_map.clone(),
+                    instrument_lookup.clone(),
                     updates.clone(),
                 )
                 .await
@@ -292,7 +293,7 @@ async fn run_private_stream(
     ws_private_url: &str,
     api_key: &str,
     api_secret: &str,
-    instrument_map: Arc<HashMap<String, InstrumentType>>,
+    instrument_lookup: Arc<InstrumentLookup>,
     updates: Sender<ExecutionUpdate>,
 ) -> Result<()> {
     let (ws_stream, _) = connect_async(ws_private_url).await?;
@@ -333,7 +334,7 @@ async fn run_private_stream(
             if topic == "order" {
                 if let Some(Value::Array(data)) = parsed.get("data") {
                     for item in data {
-                        if let Some(update) = parse_order_update(item, &instrument_map) {
+                        if let Some(update) = parse_order_update(item, &instrument_lookup) {
                             let _ = updates.send(update).await;
                         }
                     }
@@ -341,7 +342,7 @@ async fn run_private_stream(
             } else if topic == "execution" {
                 if let Some(Value::Array(data)) = parsed.get("data") {
                     for item in data {
-                        if let Some(update) = parse_execution_update(item, &instrument_map) {
+                        if let Some(update) = parse_execution_update(item, &instrument_lookup) {
                             let _ = updates.send(update).await;
                         }
                     }
@@ -355,10 +356,11 @@ async fn run_private_stream(
 
 fn parse_order_update(
     item: &Value,
-    instrument_map: &HashMap<String, InstrumentType>,
+    instrument_lookup: &InstrumentLookup,
 ) -> Option<ExecutionUpdate> {
     let symbol = item.get("symbol")?.as_str()?.to_string();
-    let instrument = *instrument_map.get(&symbol)?;
+    let category = item.get("category").and_then(Value::as_str);
+    let instrument = instrument_lookup.resolve(category, &symbol)?;
     let order_id = item.get("orderId")?.as_str()?.to_string();
     let client_id = item.get("orderLinkId").and_then(Value::as_str).map(|s| s.to_string());
     let status = item.get("orderStatus").and_then(Value::as_str).unwrap_or("").to_string();
@@ -382,10 +384,11 @@ fn parse_order_update(
 
 fn parse_execution_update(
     item: &Value,
-    instrument_map: &HashMap<String, InstrumentType>,
+    instrument_lookup: &InstrumentLookup,
 ) -> Option<ExecutionUpdate> {
     let symbol = item.get("symbol")?.as_str()?.to_string();
-    let instrument = *instrument_map.get(&symbol)?;
+    let category = item.get("category").and_then(Value::as_str);
+    let instrument = instrument_lookup.resolve(category, &symbol)?;
     let order_id = item.get("orderId")?.as_str()?.to_string();
     let client_id = item.get("orderLinkId").and_then(Value::as_str).map(|s| s.to_string());
     let side = parse_side(item.get("side")?.as_str()?);
@@ -421,6 +424,64 @@ fn parse_f64(value: Option<&Value>) -> Option<f64> {
         Value::String(s) => s.parse::<f64>().ok(),
         Value::Number(num) => num.as_f64(),
         _ => None,
+    }
+}
+
+#[derive(Clone)]
+struct InstrumentLookup {
+    by_category_symbol: HashMap<(String, String), InstrumentType>,
+    by_symbol: HashMap<String, InstrumentType>,
+    ambiguous_symbols: HashSet<String>,
+}
+
+impl InstrumentLookup {
+    fn new(instruments: &[InstrumentConfig]) -> Self {
+        let mut by_category_symbol = HashMap::new();
+        let mut by_symbol = HashMap::new();
+        let mut ambiguous_symbols = HashSet::new();
+
+        for inst in instruments {
+            by_category_symbol.insert(
+                (inst.instrument_type.category().to_string(), inst.symbol.clone()),
+                inst.instrument_type,
+            );
+
+            if let Some(existing) = by_symbol.get(&inst.symbol) {
+                if *existing != inst.instrument_type {
+                    ambiguous_symbols.insert(inst.symbol.clone());
+                    by_symbol.remove(&inst.symbol);
+                }
+            } else if !ambiguous_symbols.contains(&inst.symbol) {
+                by_symbol.insert(inst.symbol.clone(), inst.instrument_type);
+            }
+        }
+
+        Self {
+            by_category_symbol,
+            by_symbol,
+            ambiguous_symbols,
+        }
+    }
+
+    fn resolve(&self, category: Option<&str>, symbol: &str) -> Option<InstrumentType> {
+        if let Some(category) = category {
+            if let Some(inst) = self
+                .by_category_symbol
+                .get(&(category.to_string(), symbol.to_string()))
+            {
+                return Some(*inst);
+            }
+        }
+
+        if self.ambiguous_symbols.contains(symbol) {
+            tracing::warn!(
+                symbol = %symbol,
+                "ambiguous symbol without category; skipping update"
+            );
+            return None;
+        }
+
+        self.by_symbol.get(symbol).copied()
     }
 }
 
