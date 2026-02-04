@@ -1,4 +1,4 @@
-use crate::config::InstrumentConfig;
+use crate::config::{InstrumentConfig, StrategyConfig};
 use crate::execution::{ExecutionAction, ExecutionUpdate, OrderAck, OrderIntent};
 use crate::types::{
     ExecutionFill, InstrumentType, LiveOrder, MarketDataEvent, MarketDataKind, OrderBookSnapshot,
@@ -12,12 +12,12 @@ pub struct StrategyManager {
 }
 
 impl StrategyManager {
-    pub fn new(instruments: Vec<InstrumentConfig>) -> Self {
+    pub fn new(instruments: Vec<InstrumentConfig>, strategy: StrategyConfig) -> Self {
         let mut strategies = HashMap::new();
         for instrument in instruments {
             strategies.insert(
                 (instrument.instrument_type, instrument.symbol.clone()),
-                InstrumentStrategy::new(instrument),
+                InstrumentStrategy::new(instrument, strategy.clone()),
             );
         }
         Self { strategies }
@@ -89,12 +89,12 @@ struct SignalState {
 }
 
 impl SignalState {
-    fn new() -> Self {
+    fn new(config: &StrategyConfig) -> Self {
         Self {
-            spread_window: RollingWindow::new(40),
-            mid_window: RollingWindow::new(40),
-            trade_flow_window: RollingWindow::new(50),
-            trade_qty_window: RollingWindow::new(50),
+            spread_window: RollingWindow::new(config.spread_window),
+            mid_window: RollingWindow::new(config.mid_window),
+            trade_flow_window: RollingWindow::new(config.trade_flow_window),
+            trade_qty_window: RollingWindow::new(config.trade_qty_window),
             last_large_trade_side: None,
             last_large_trade_ts: 0,
             bid_persistence: 0,
@@ -104,17 +104,17 @@ impl SignalState {
         }
     }
 
-    fn update_orderbook(&mut self, book: &OrderBookSnapshot) {
+    fn update_orderbook(&mut self, book: &OrderBookSnapshot, config: &StrategyConfig) {
         if let (Some(spread), Some(mid)) = (book.spread(), book.mid_price()) {
             self.spread_window.push(spread);
             self.mid_window.push(mid);
         }
 
-        let avg_size = average_top_size(book, 3).unwrap_or(0.0);
+        let avg_size = average_top_size(book, config.iceberg_depth).unwrap_or(0.0);
         if let Some(best_bid) = book.best_bid() {
-            let is_large = avg_size > 0.0 && best_bid.size > avg_size * 3.0;
+            let is_large = avg_size > 0.0 && best_bid.size > avg_size * config.iceberg_multiplier;
             let stable = (best_bid.size - self.last_best_bid_size).abs()
-                <= self.last_best_bid_size * 0.05;
+                <= self.last_best_bid_size * config.iceberg_stable_pct;
             if is_large && stable {
                 self.bid_persistence += 1;
             } else {
@@ -124,9 +124,9 @@ impl SignalState {
         }
 
         if let Some(best_ask) = book.best_ask() {
-            let is_large = avg_size > 0.0 && best_ask.size > avg_size * 3.0;
+            let is_large = avg_size > 0.0 && best_ask.size > avg_size * config.iceberg_multiplier;
             let stable = (best_ask.size - self.last_best_ask_size).abs()
-                <= self.last_best_ask_size * 0.05;
+                <= self.last_best_ask_size * config.iceberg_stable_pct;
             if is_large && stable {
                 self.ask_persistence += 1;
             } else {
@@ -136,13 +136,13 @@ impl SignalState {
         }
     }
 
-    fn update_trade(&mut self, trade: &Trade) {
+    fn update_trade(&mut self, trade: &Trade, config: &StrategyConfig) {
         let signed_qty = trade.qty * trade.side.sign();
         self.trade_flow_window.push(signed_qty);
         self.trade_qty_window.push(trade.qty);
 
         let avg_qty = self.trade_qty_window.mean().unwrap_or(0.0);
-        if avg_qty > 0.0 && trade.qty > avg_qty * 3.0 {
+        if avg_qty > 0.0 && trade.qty > avg_qty * config.large_trade_multiplier {
             self.last_large_trade_side = Some(trade.side);
             self.last_large_trade_ts = trade.timestamp;
         }
@@ -172,29 +172,29 @@ impl SignalState {
         }
     }
 
-    fn mean_reversion_signal(&self, now: u64) -> f64 {
+    fn mean_reversion_signal(&self, now: u64, config: &StrategyConfig) -> f64 {
         if let Some(side) = self.last_large_trade_side {
-            if now - self.last_large_trade_ts < 1200 {
+            if now - self.last_large_trade_ts < config.mean_reversion_window_ms {
                 return -side.sign();
             }
         }
         0.0
     }
 
-    fn iceberg_bias(&self) -> f64 {
-        let bid_iceberg = self.bid_persistence >= 3;
-        let ask_iceberg = self.ask_persistence >= 3;
+    fn iceberg_bias(&self, config: &StrategyConfig) -> f64 {
+        let bid_iceberg = self.bid_persistence >= config.iceberg_persistence;
+        let ask_iceberg = self.ask_persistence >= config.iceberg_persistence;
         match (bid_iceberg, ask_iceberg) {
-            (true, false) => 0.6,
-            (false, true) => -0.6,
+            (true, false) => config.iceberg_bias,
+            (false, true) => -config.iceberg_bias,
             _ => 0.0,
         }
     }
 
-    fn toxicity_score(&self) -> f64 {
+    fn toxicity_score(&self, config: &StrategyConfig) -> f64 {
         let flow = self.trade_flow_imbalance();
         let momentum = self.momentum();
-        if flow.signum() == momentum.signum() && flow.abs() > 0.15 {
+        if flow.signum() == momentum.signum() && flow.abs() > config.toxicity_flow_threshold {
             flow.abs()
         } else {
             0.0
@@ -204,6 +204,7 @@ impl SignalState {
 
 pub struct InstrumentStrategy {
     config: InstrumentConfig,
+    strategy: StrategyConfig,
     remaining_qty: f64,
     start_ts: u64,
     last_decision_ts: u64,
@@ -213,26 +214,27 @@ pub struct InstrumentStrategy {
 }
 
 impl InstrumentStrategy {
-    pub fn new(config: InstrumentConfig) -> Self {
+    pub fn new(config: InstrumentConfig, strategy: StrategyConfig) -> Self {
         Self {
             remaining_qty: config.target_qty,
             start_ts: now_millis(),
             last_decision_ts: 0,
             orderbook: None,
             tracker: None,
-            signals: SignalState::new(),
+            signals: SignalState::new(&strategy),
+            strategy,
             config,
         }
     }
 
     pub fn on_orderbook(&mut self, book: OrderBookSnapshot) -> Vec<ExecutionAction> {
-        self.signals.update_orderbook(&book);
+        self.signals.update_orderbook(&book, &self.strategy);
         self.orderbook = Some(book);
         self.maybe_act()
     }
 
     pub fn on_trade(&mut self, trade: Trade) -> Vec<ExecutionAction> {
-        self.signals.update_trade(&trade);
+        self.signals.update_trade(&trade, &self.strategy);
         self.update_queue_position(&trade);
         self.maybe_act()
     }
@@ -311,7 +313,9 @@ impl InstrumentStrategy {
             return Vec::new();
         }
 
-        if self.last_decision_ts != 0 && now - self.last_decision_ts < 150 {
+        if self.last_decision_ts != 0
+            && now - self.last_decision_ts < self.strategy.min_decision_interval_ms
+        {
             return Vec::new();
         }
 
@@ -322,16 +326,19 @@ impl InstrumentStrategy {
 
         let spread = book.spread().unwrap_or(0.0);
         let mid = book.mid_price().unwrap_or(0.0);
-        let imbalance = orderbook_imbalance(book, 5);
+        let imbalance = orderbook_imbalance(book, self.strategy.imbalance_depth);
         let flow = self.signals.trade_flow_imbalance();
         let momentum = self.signals.momentum();
-        let mean_rev = self.signals.mean_reversion_signal(now);
-        let iceberg = self.signals.iceberg_bias();
+        let mean_rev = self.signals.mean_reversion_signal(now, &self.strategy);
+        let iceberg = self.signals.iceberg_bias(&self.strategy);
         let spread_widen = self.signals.spread_widen_score();
-        let toxicity = self.signals.toxicity_score();
+        let toxicity = self.signals.toxicity_score(&self.strategy);
 
-        let raw_alpha =
-            0.45 * imbalance + 0.25 * flow + 0.15 * momentum + 0.1 * mean_rev + 0.05 * iceberg;
+        let raw_alpha = self.strategy.imbalance_weight * imbalance
+            + self.strategy.flow_weight * flow
+            + self.strategy.momentum_weight * momentum
+            + self.strategy.mean_reversion_weight * mean_rev
+            + self.strategy.iceberg_weight * iceberg;
         let side_alpha = raw_alpha * self.config.side.sign();
 
         let urgency = clamp(
@@ -355,12 +362,15 @@ impl InstrumentStrategy {
         let should_cancel = self.tracker.as_ref().map_or(false, |tracker| {
             let age = now - tracker.order.created_at;
             let price_moved = best_price(book, tracker.order.side)
-                .map(|best| (best - tracker.order.price).abs() > spread * 0.1)
+                .map(|best| {
+                    (best - tracker.order.price).abs()
+                        > spread * self.strategy.spread_move_cancel_factor
+                })
                 .unwrap_or(false);
             age > self.config.max_order_age_ms
-                || toxicity > 0.35
-                || spread_widen > 0.5
-                || (side_alpha < -0.1 && price_moved)
+                || toxicity > self.strategy.toxicity_cancel_threshold
+                || spread_widen > self.strategy.spread_widen_cancel_threshold
+                || (side_alpha < self.strategy.cancel_alpha_threshold && price_moved)
         });
 
         let mut actions = Vec::new();
@@ -375,11 +385,16 @@ impl InstrumentStrategy {
             }
         }
 
-        let wants_aggressive = urgency > 0.7 || side_alpha < -0.08 || fill_prob < 0.2;
-        let wants_passive = side_alpha > 0.05 && toxicity < 0.2 && spread_widen < 0.6;
+        let wants_aggressive = urgency > self.strategy.urgency_aggressive_threshold
+            || side_alpha < self.strategy.aggressive_alpha_threshold
+            || fill_prob < self.strategy.fill_prob_aggressive_threshold;
+        let wants_passive = side_alpha > self.strategy.passive_alpha_threshold
+            && toxicity < self.strategy.toxicity_passive_threshold
+            && spread_widen < self.strategy.spread_widen_passive_threshold;
 
         if self.tracker.is_none() && (wants_aggressive || wants_passive) {
-            let use_aggressive = wants_aggressive && (!wants_passive || urgency > 0.85);
+            let use_aggressive = wants_aggressive
+                && (!wants_passive || urgency > self.strategy.urgency_force_aggressive_threshold);
             let (price, post_only) = if use_aggressive {
                 (best_price(book, self.config.side.opposite()), false)
             } else {
@@ -425,9 +440,13 @@ impl InstrumentStrategy {
 
     fn child_qty(&self, book: &OrderBookSnapshot, post_only: bool) -> f64 {
         let visible_liquidity = if post_only {
-            depth_liquidity(book, self.config.side, 3)
+            depth_liquidity(book, self.config.side, self.strategy.liquidity_depth)
         } else {
-            depth_liquidity(book, self.config.side.opposite(), 3)
+            depth_liquidity(
+                book,
+                self.config.side.opposite(),
+                self.strategy.liquidity_depth,
+            )
         };
         if visible_liquidity <= 0.0 {
             return 0.0;

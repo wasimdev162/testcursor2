@@ -25,6 +25,7 @@ pub struct AppConfig {
     pub ws_private_url: String,
     pub decision_interval_ms: u64,
     pub instruments: Vec<InstrumentConfig>,
+    pub strategy: StrategyConfig,
 }
 
 impl AppConfig {
@@ -45,6 +46,7 @@ impl AppConfig {
         let ws_private_url = env::var("BYBIT_WS_PRIVATE")
             .unwrap_or_else(|_| "wss://stream-testnet.bybit.com/v5/private".into());
         let decision_interval_ms = read_u64("DECISION_INTERVAL_MS", 200);
+        let strategy = StrategyConfig::from_env();
 
         let spot = build_instrument(
             "SPOT",
@@ -77,7 +79,81 @@ impl AppConfig {
             ws_private_url,
             decision_interval_ms,
             instruments: vec![spot, perp, option],
+            strategy,
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StrategyConfig {
+    pub imbalance_weight: f64,
+    pub flow_weight: f64,
+    pub momentum_weight: f64,
+    pub mean_reversion_weight: f64,
+    pub iceberg_weight: f64,
+    pub iceberg_bias: f64,
+    pub passive_alpha_threshold: f64,
+    pub aggressive_alpha_threshold: f64,
+    pub cancel_alpha_threshold: f64,
+    pub toxicity_cancel_threshold: f64,
+    pub toxicity_passive_threshold: f64,
+    pub toxicity_flow_threshold: f64,
+    pub spread_widen_cancel_threshold: f64,
+    pub spread_widen_passive_threshold: f64,
+    pub min_decision_interval_ms: u64,
+    pub mean_reversion_window_ms: u64,
+    pub large_trade_multiplier: f64,
+    pub iceberg_multiplier: f64,
+    pub iceberg_persistence: u32,
+    pub iceberg_stable_pct: f64,
+    pub urgency_aggressive_threshold: f64,
+    pub urgency_force_aggressive_threshold: f64,
+    pub fill_prob_aggressive_threshold: f64,
+    pub spread_move_cancel_factor: f64,
+    pub imbalance_depth: usize,
+    pub liquidity_depth: usize,
+    pub iceberg_depth: usize,
+    pub spread_window: usize,
+    pub mid_window: usize,
+    pub trade_flow_window: usize,
+    pub trade_qty_window: usize,
+}
+
+impl StrategyConfig {
+    pub fn from_env() -> Self {
+        Self {
+            imbalance_weight: read_f64("STRAT_IMBALANCE_WEIGHT", 0.45),
+            flow_weight: read_f64("STRAT_FLOW_WEIGHT", 0.25),
+            momentum_weight: read_f64("STRAT_MOMENTUM_WEIGHT", 0.15),
+            mean_reversion_weight: read_f64("STRAT_MEAN_REV_WEIGHT", 0.1),
+            iceberg_weight: read_f64("STRAT_ICEBERG_WEIGHT", 0.05),
+            iceberg_bias: read_f64("STRAT_ICEBERG_BIAS", 0.6),
+            passive_alpha_threshold: read_f64("STRAT_PASSIVE_ALPHA", 0.05),
+            aggressive_alpha_threshold: read_f64("STRAT_AGGRESSIVE_ALPHA", -0.08),
+            cancel_alpha_threshold: read_f64("STRAT_CANCEL_ALPHA", -0.1),
+            toxicity_cancel_threshold: read_f64("STRAT_TOXICITY_CANCEL", 0.35),
+            toxicity_passive_threshold: read_f64("STRAT_TOXICITY_PASSIVE", 0.2),
+            toxicity_flow_threshold: read_f64("STRAT_TOXICITY_FLOW", 0.15),
+            spread_widen_cancel_threshold: read_f64("STRAT_SPREAD_WIDEN_CANCEL", 0.5),
+            spread_widen_passive_threshold: read_f64("STRAT_SPREAD_WIDEN_PASSIVE", 0.6),
+            min_decision_interval_ms: read_u64("STRAT_MIN_DECISION_MS", 150),
+            mean_reversion_window_ms: read_u64("STRAT_MEAN_REVERSION_MS", 1200),
+            large_trade_multiplier: read_f64("STRAT_LARGE_TRADE_MULT", 3.0),
+            iceberg_multiplier: read_f64("STRAT_ICEBERG_MULT", 3.0),
+            iceberg_persistence: read_u32("STRAT_ICEBERG_PERSIST", 3),
+            iceberg_stable_pct: read_f64("STRAT_ICEBERG_STABLE_PCT", 0.05),
+            urgency_aggressive_threshold: read_f64("STRAT_URGENCY_AGGR", 0.7),
+            urgency_force_aggressive_threshold: read_f64("STRAT_URGENCY_FORCE_AGGR", 0.85),
+            fill_prob_aggressive_threshold: read_f64("STRAT_FILL_PROB_AGGR", 0.2),
+            spread_move_cancel_factor: read_f64("STRAT_SPREAD_MOVE_CANCEL", 0.1),
+            imbalance_depth: read_usize("STRAT_IMBALANCE_DEPTH", 5),
+            liquidity_depth: read_usize("STRAT_LIQUIDITY_DEPTH", 3),
+            iceberg_depth: read_usize("STRAT_ICEBERG_DEPTH", 3),
+            spread_window: read_usize("STRAT_SPREAD_WINDOW", 40),
+            mid_window: read_usize("STRAT_MID_WINDOW", 40),
+            trade_flow_window: read_usize("STRAT_TRADE_FLOW_WINDOW", 50),
+            trade_qty_window: read_usize("STRAT_TRADE_QTY_WINDOW", 50),
+        }
     }
 }
 
@@ -123,5 +199,19 @@ fn read_f64(key: &str, default: f64) -> f64 {
     env::var(key)
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn read_u32(key: &str, default: u32) -> u32 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn read_usize(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
 }

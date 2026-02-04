@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     );
     market_data.run().await?;
 
-    let mut strategies = StrategyManager::new(config.instruments.clone());
+    let mut strategies = StrategyManager::new(config.instruments.clone(), config.strategy.clone());
     let mut performance = PerformanceTracker::new(&config.instruments);
     let mut ticker = interval(Duration::from_millis(config.decision_interval_ms));
 
