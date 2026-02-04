@@ -13,7 +13,6 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -296,8 +295,7 @@ async fn run_private_stream(
     instrument_map: Arc<HashMap<String, InstrumentType>>,
     updates: Sender<ExecutionUpdate>,
 ) -> Result<()> {
-    let url = Url::parse(ws_private_url)?;
-    let (ws_stream, _) = connect_async(url).await?;
+    let (ws_stream, _) = connect_async(ws_private_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     let expires = now_millis() + 10_000;

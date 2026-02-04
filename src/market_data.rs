@@ -7,7 +7,6 @@ use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use url::Url;
 
 pub struct MarketDataHandler {
     ws_public_base: String,
@@ -121,8 +120,7 @@ async fn run_public_stream(
     sender: Sender<MarketDataEvent>,
 ) -> Result<()> {
     let ws_url = format!("{}/{}", ws_public_base, instrument.instrument_type.ws_public_path());
-    let url = Url::parse(&ws_url)?;
-    let (ws_stream, _) = connect_async(url).await?;
+    let (ws_stream, _) = connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     let depth = if instrument.instrument_type == crate::types::InstrumentType::Option {
