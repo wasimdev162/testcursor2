@@ -28,7 +28,16 @@ Setup
 -----
 1. Create a Bybit Testnet account and generate API keys.
 2. Fund the account with testnet assets.
-3. Export environment variables:
+3. Create a `.env` file or export environment variables.
+
+Example `.env`:
+
+```
+BYBIT_API_KEY=...
+BYBIT_API_SECRET=...
+```
+
+Shell export alternative:
 
 ```
 export BYBIT_API_KEY="..."
